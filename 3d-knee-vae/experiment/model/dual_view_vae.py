@@ -78,6 +78,7 @@ def center_crop(ori_shape, target_shape): #z1, y1, x1, z2, y2, x2 = crop_box
 
     return [start_z,start_y,start_x,end_z,end_y,end_x]
 
+
 # def save_nifti(pixel_data, affine, fpath):
 #     import numpy as np
 #     import nibabel as nib
@@ -289,7 +290,11 @@ class FeatureRegistration(nn.Module):
         if use_out_embedding:
             self.out_fov_embedding = nn.Embedding(1, feat_dim)
 
-        self.aspp = DenseASPP(Model_CFG,n_class=feat_dim)
+        self.aspp = SimpleASPP(3,in_channels=4,conv_out_channels=1)
+    
+        # 提取高频信息的卷积层
+        self.high_freq_conv = nn.Conv3d(4, 4, kernel_size=3, stride=1, padding=1, bias=False)
+        self.scale_weights = torch.tensor([0.5, 0.3, 0.2])
 
     @staticmethod
     def _transform_affine_to_feature(feats, affine, spatial_dim):   #new_affine
@@ -320,7 +325,23 @@ class FeatureRegistration(nn.Module):
             T[i, i] = (dim - 1) / 2
             T[i, -1] = (dim - 1) / 2
         return T.to(feats)
-    
+
+    def multi_scale_interpolation(self, feats, grid, align_corners=False):
+        scales = [1.0, 0.5, 2.0]  # 下采样和上采样尺度
+        feats_scaled = []
+        
+        for scale in scales:
+            upsampled_feats = F.interpolate(feats, scale_factor=scale, mode='trilinear', align_corners=align_corners)
+            
+            feats_interpolated = F.grid_sample(upsampled_feats, grid, mode='bilinear', align_corners=align_corners)
+            feats_scaled.append(feats_interpolated)
+        
+        weighted_feats = torch.zeros_like(feats_scaled[0])
+        for i, scale_feats in enumerate(feats_scaled):
+            weighted_feats += scale_feats * self.scale_weights[i].view(1, -1, 1, 1).to(scale_feats.device)  # 按照权重加权
+
+        return weighted_feats
+
     # @profile
     def _regist_feats2_to_feats1(self, feats1, affine1, feats2, affine2, align_corners=False,aspp=True):
         affine1, affine2 = affine1.float(), affine2.float()
@@ -330,10 +351,23 @@ class FeatureRegistration(nn.Module):
         theta = theta[:, :3]
         grid = F.affine_grid(theta, feats1.shape, align_corners=align_corners)
         # aspp
-        # if aspp:
-        #     feats2 = self.aspp(feats2) #[1 4 32 96 96]
+        if aspp:
+            high_freq_feats = self.high_freq_conv(feats1)
+            feats2 = self.aspp(feats2) #[1 4 32 96 96]
+            feats = F.grid_sample(feats2, grid, mode="bilinear", align_corners=align_corners)
+            feats = high_freq_feats + feats
 
-        feats = F.grid_sample(feats2, grid, mode="bilinear", align_corners=align_corners)
+        else:
+            feats = F.grid_sample(feats2, grid, mode="bilinear", align_corners=align_corners)
+
+        # if aspp:
+        #     high_freq_feats = self.high_freq_conv(feats2) #[1 4 32 96 96]
+        #     multi_scale_feats = self.multi_scale_interpolation(feats2, grid, align_corners)
+        #     feats = multi_scale_feats + high_freq_feats
+        #     del high_freq_feats, multi_scale_feats
+        # else:
+        #     feats = F.grid_sample(feats2, grid, mode="bilinear", align_corners=align_corners)  
+
         if self.use_out_embedding:
             in_fov = F.grid_sample(torch.ones_like(feats2[:, :1]), grid, mode="bilinear", align_corners=align_corners)
             # in_fov 的值在视野内的区域接近 1，在视野外的区域接近 0
@@ -368,71 +402,6 @@ class FeatureRegistration(nn.Module):
         return feats2_to_1,mask,affine1,affine2
 
 
-class DualViewUNet(Register_VAE):
-    def __init__(self, num_classes, aux_seg=True, single_view=False):
-        super(DualViewUNet, self).__init__(
-            kernels=[[1, 3, 3], [1, 3, 3], [1, 3, 3], [3, 3, 3], [3, 3, 3], [3, 3, 3]],
-            strides=[[1, 1, 1], [1, 2, 2], [1, 2, 2], [1, 2, 2], [2, 2, 2], [2, 2, 2]],
-            width_factor=0.25, n_class=num_classes)  # shared encoder
-        self.single_view = single_view
-        # build aux decoder
-        self.aux_seg = aux_seg
-        if aux_seg:
-            self.upsamples_aux = self.get_module_list(
-                conv_block=UpsampleBlock,
-                in_channels=self.filters[1:][::-1],
-                out_channels=self.filters[:-1][::-1],
-                kernels=self.kernels[1:][::-1],  # todo: change it to 3*3*3 conv??
-                strides=self.strides[1:][::-1],
-            )
-            self.output_block_aux = self.get_output_block(decoder_level=0)
-        # build cross view feature fusion module
-        if not self.single_view:
-            n_layers = len(self.filters[:-1])
-            self.feat_regist = nn.ModuleList(
-                FeatureRegistration((128, 128), (128, 128), 16, 16, feat_dim) for feat_dim in self.filters[:-1]
-            )
-            self.fusion_convs = self.get_module_list(
-                conv_block=ConvBlock,
-                in_channels=[_ * 2 for _ in self.filters[:-1]],
-                out_channels=self.filters[:-1],
-                kernels=[(3, 3, 3), ] * n_layers,
-                strides=[(1, 1, 1), ] * n_layers,
-            )
-        self.apply(self.initialize_weights)
-
-    def _forward_fusion(self, enc_outs1, aff1, enc_outs2, aff2):
-        fusion_outputs = []
-        for align_layer, fusion_layer, enc1, enc2 in zip(self.feat_regist, self.fusion_convs,
-                                                         enc_outs1, enc_outs2):
-            enc2_align = align_layer(enc1, aff1, enc2, aff2)
-            out = fusion_layer(torch.cat([enc1, enc2_align], dim=1))
-            fusion_outputs.append(out)
-        return fusion_outputs
-
-    def _forward_decoders_aux(self, out, encoder_outputs):
-        decoder_outputs = []
-        for upsample, skip in zip(self.upsamples_aux, reversed(encoder_outputs)):
-            out = upsample(out, skip)
-            decoder_outputs.append(out)
-        return out, decoder_outputs
-
-    def forward(self, im1, aff1, im2, aff2):
-        out1, enc_outs1 = self._forward_encoders(im1)
-        if self.single_view:
-            out1, _ = self._forward_decoders(out1, enc_outs1)
-            out1 = self.output_block(out1)
-            return out1, None
-        out2, enc_outs2 = self._forward_encoders(im2)
-        enc_outs1 = self._forward_fusion(enc_outs1, aff1, enc_outs2, aff2)
-        out1, _ = self._forward_decoders(out1, enc_outs1)
-        out1 = self.output_block(out1)
-        if self.aux_seg:
-            out2, _ = self._forward_decoders_aux(out2, enc_outs2)
-            out2 = self.output_block_aux(out2)
-        else:
-            out2 = None
-        return out1, out2
 
 
 class DualViewSegNet(nn.Module):
@@ -447,6 +416,7 @@ class DualViewSegNet(nn.Module):
         self.feat_regist = []
         self.feat_regist = FeatureRegistration((384, 384), (384, 384), 32, 32, self.filters[0], use_out_embedding=True) #[（ori_w,ori_h）,（ori_w,ori_h）,ori_d,ori_d]
 
+        
         self.net_depth = 2 #384-->96 步长为2
         self.net = Register_VAE(n_channels, gf_dim,self.net_depth,self.feat_regist, lightingdecoder=self.ld, encoder_pre= encoder_pre, decoder_pre=decoder_pre)
 
@@ -495,47 +465,5 @@ class DummySeries2(object):
         # 创建当前对象的副本
         return DummySeries2(self.__dict__,self.images.device)
 
-@register_model
-def mri_dual_view_seg_net(**kwargs):
-    model = DualViewSegNet(num_classes=kwargs['num_classes'],
-                           crop_size=(16, 128, 128), resize_dim=(16, 128, 128))
-    return model
 
-
-@register_model
-def mri_dual_view_seg_net_noaux(**kwargs):
-    model = DualViewSegNet(num_classes=kwargs['num_classes'],
-                           crop_size=(16, 128, 128), resize_dim=(16, 128, 128),
-                           aux_seg=False)
-    return model
-
-
-@register_model
-def mri_dual_view_seg_net_noaux_ft(**kwargs):
-    model = DualViewSegNet(num_classes=kwargs['num_classes'],
-                           crop_size=(16, 128, 128), resize_dim=(16, 128, 128),
-                           aux_seg=False)
-    ckpt_path = "/mnt/users/workspace/classification/timm3d/output/train/mri_dual_view_seg_net_noaux/model_best.pth.tar"
-    checkpoint = torch.load(ckpt_path, map_location="cpu")
-    model.load_state_dict(checkpoint["state_dict"], strict=True)
-    return model
-
-
-@register_model
-def mri_dual_view_seg_net_noaux_ft_cteval(**kwargs):
-    model = DualViewSegNet(num_classes=kwargs['num_classes'],
-                           crop_size=(16, 128, 128), resize_dim=(16, 128, 128),
-                           aux_seg=False, ct_eval=True)
-    ckpt_path = "/mnt/users/workspace/classification/timm3d/output/train/mri_dual_view_seg_net_noaux/model_best.pth.tar"
-    checkpoint = torch.load(ckpt_path, map_location="cpu")
-    model.load_state_dict(checkpoint["state_dict"], strict=True)
-    return model
-
-
-@register_model
-def mri_single_view_seg_net(**kwargs):
-    model = DualViewSegNet(num_classes=kwargs['num_classes'],
-                           crop_size=(16, 128, 128), resize_dim=(16, 128, 128),
-                           aux_seg=False, single_view=True)
-    return model
 

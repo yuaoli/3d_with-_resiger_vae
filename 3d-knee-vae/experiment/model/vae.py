@@ -256,7 +256,7 @@ class Register_VAE(nn.Module):
         register = True
         dic_list = []
         
-        for series1,series2 in [(series1_,series2_)]:  #,(series2_,series1_)
+        for series1,series2 in [(series1_,series2_),(series2_,series1_)]:  #,(series2_,series1_)
 
             x1 = series1.images.to(device) #[1 1 256 256 32]
             aff1 = series1.affine.to(device)

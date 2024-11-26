@@ -308,7 +308,7 @@ def train(model, optimizer_vae,optimizer_disc, epoch, step, train_loader, Discri
         sagtocor_dict,cortosag_dict = model(batch,rank)#[1 16 32 4 32] #x1_mu, x1_std,x1_reconstruction
 
 
-        for dic in (sagtocor_dict,):   #cortosag_dict
+        for dic in (sagtocor_dict,cortosag_dict):   #
 
             optimizer_vae.zero_grad()
             optimizer_disc.zero_grad()
@@ -480,7 +480,7 @@ def test(model, epoch, step, test_loader, Discriminator, writer,
             vae_loss_3d = 0
             vae_losses_2d = []
             disc_losses = []
-            for dic in (sagtocor_dict,):#,cortosag_dict
+            for dic in (sagtocor_dict,cortosag_dict):#,
                 #x1
                 x1_rec_loss = 0
                 x1_kl_loss = 0              
@@ -797,7 +797,7 @@ if __name__ == "__main__":
     # args.resume_path = '/mnt/users/3d_resiger_vae2/experiments/3d_vae_sag&cor_pdfs2024-11-21-15-26-20/gen/vol_256_lr_0.0001_kl_1e-05__bsize_1/checkpoints/model_00000001.pth.tar'
     args.phase = 'train'
     args.pretrain_path = None
-    args.pretrain_path = '/mnt/users/3d_resiger_vae/experiments/3d_vae_sag_pd2024-11-19-17-13-31/gen/vol_256_lr_0.0001_kl_1e-05__bsize_1/checkpoints/model_00000059.pth.tar'
+    # args.pretrain_path = '/mnt/users/3d_resiger_vae/experiments/3d_vae_sag_pd2024-11-19-17-13-31/gen/vol_256_lr_0.0001_kl_1e-05__bsize_1/checkpoints/model_00000059.pth.tar'
 
     ''' cuda devices '''
     gpu_str = ','.join(str(x) for x in args.gpu_ids)

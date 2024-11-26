@@ -15,7 +15,7 @@ def adopt_weight(weight, global_step, threshold=0, value=0.):
     if global_step < threshold:
         weight = value
     else:
-        print(global_step)
+        # print(global_step)
         weight = weight
     return weight
 
