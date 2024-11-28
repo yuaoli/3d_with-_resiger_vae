@@ -338,9 +338,10 @@ def train(model, optimizer_vae,optimizer_disc, epoch, step, train_loader, Discri
             x2_rec_loss += reconstruction_loss(x2_reconstruction,x2_input)
             x2_kl_loss += KLLoss(x2_mu, x2_std)
 
+            #lat_recloss
+            lat_rec_loss = dic['lat_loss_1'] + dic['lat_loss_2']
 
-
-            rec_loss = x1_rec_loss + x2_rec_loss
+            rec_loss = x1_rec_loss + x2_rec_loss + lat_rec_loss
             kl_loss = x1_kl_loss + x2_kl_loss
             vae_loss_3d += rec_loss * args.reconstruction_data_loss_weight + kl_loss * args.kl_latent_loss_weight
 
@@ -502,8 +503,10 @@ def test(model, epoch, step, test_loader, Discriminator, writer,
                 x2_rec_loss += reconstruction_loss(x2_reconstruction,x2_input)
                 x2_kl_loss += KLLoss(x2_mu, x2_std)
 
+                #lat_recloss
+                lat_rec_loss = dic['lat_loss_1'] + dic['lat_loss_2']
 
-                rec_loss = x1_rec_loss + x2_rec_loss
+                rec_loss = x1_rec_loss + x2_rec_loss + lat_rec_loss
                 kl_loss = x1_kl_loss + x2_kl_loss
                 vae_loss_3d += rec_loss * args.reconstruction_data_loss_weight + kl_loss * args.kl_latent_loss_weight
 
@@ -611,7 +614,7 @@ def main(rank, world_size, args):
 
     torch.manual_seed(args.seed)
 
-    model = DualViewSegNet(args.n_channels, gf_dim=2, lat_ch1 = 4,lat_ch2 = 4, ld=False)
+    model = DualViewSegNet(args.n_channels, gf_dim=2, lat_ch1=2, lat_ch2 = 4, ld=False)
     Discriminator = LPIPSWithDiscriminator(disc_start = 8001,
                                             kl_weight = 1.0e-06,
                                             disc_in_channels=3,

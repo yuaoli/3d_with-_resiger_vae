@@ -104,7 +104,6 @@ class ResBlockMid(nn.Module):
         conv2 = self.conv2_block(conv1)
         if self.act:
             conv2 = self.lrelu(conv2)
-
         return conv1 + conv2
         
 
@@ -151,20 +150,30 @@ class Encoder(nn.Module):
 
         self.res1 = ResBlockDown(gf_dim * 1, gf_dim * 1) #2 2
 
-        self.res2 = ResBlockDown(gf_dim * 1, gf_dim * 2) #2 4
-        self.res2_stdev = ResBlockDown(gf_dim * 1, gf_dim * 2, act=False)  
+        self.res2_mu = ResBlockDown(gf_dim * 2, gf_dim * 2) #2 4
+        self.res2_stdev = ResBlockDown(gf_dim * 2, gf_dim * 2, act=False)  
 
-        self.res3 = ResBlockDown(gf_dim * 2, gf_dim * 4) #4 8 
-        self.res3_stdev = ResBlockDown(gf_dim * 2, gf_dim * 4, act=False)
+        self.res3_mu = ResBlockDown(gf_dim * 1, gf_dim * 2) #4 8 
+        self.res3_stdev = ResBlockDown(gf_dim * 1, gf_dim * 2, act=False)
 
-    def encode(self, x):#[1 1 32 384 384]
-
+    def encode_1(self, x):#[1 1 32 384 384]
         conv1 = self.conv1_block(x) #[1 2 32 384 384]
         z = self.res1(conv1)        #[1 2 32 192 192]        
         z_mean = self.res2(z)       #[1, 4, 32, 96, 96]
         z_std = self.res2_stdev(z)  #[1, 4, 32, 96, 96]
-
         return z_mean, z_std
+    
+    def encode_2(self, z):#[1 1 32 384 384]
+        z_mean = self.res2_mu(z)       #[1, 4, 32, 96, 96]
+        z_std = self.res2_stdev(z)  #[1, 4, 32, 96, 96]
+        z =  self.reparameterize(z_mean, z_std)
+        return z,z_mean,z_std
+
+    def encode_3(self, x):#[1 1 32 384 384]
+        conv1 = self.conv1_block(x) #[1 2 32 384 384]
+        z = self.res1(conv1)        #[1 2 32 192 192]        
+        return z
+    
 
     def reparameterize(self, mu, std):
         std = torch.exp(std)
@@ -172,7 +181,7 @@ class Encoder(nn.Module):
         return mu + eps*std
 
     def forward(self, x):
-        mu, std = self.encode(x)
+        mu, std = self.encode_1(x)
         z = self.reparameterize(mu, std)
         return z, mu, std
 
@@ -219,7 +228,8 @@ class Midblock(nn.Module):
     def __init__(self, n_channels, gf_dim=16):
         super(Midblock, self).__init__()
 
-        self.res0 = ResBlockMid(gf_dim*2, gf_dim * 2)
+        # gf_dim = int(gf_dim/2)
+        self.res0 = ResBlockMid(gf_dim*2, gf_dim * 1)
         self.res1 = ResBlockMid(gf_dim*2, gf_dim * 2)
         self.conv_1_block = nn.Sequential(
             nn.Conv3d(gf_dim*2, gf_dim*2, 3, stride=1, padding=1),
@@ -250,6 +260,7 @@ class Register_VAE(nn.Module):
 
         self.midblock = Midblock(n_channels, gf_dim)
         self.feat_regist = feat_regist
+        self.latloss = nn.MSELoss()
 
     # @profile
     def forward(self,series1_, series2_, device=None ,save_resize_vis=False,save_path=None ):#(x1--原仿射矩阵,x2--目标仿射矩阵) #im1, aff1, im2, aff2
@@ -258,62 +269,36 @@ class Register_VAE(nn.Module):
         
         for series1,series2 in [(series1_,series2_),(series2_,series1_)]:  #,(series2_,series1_)
 
-            x1 = series1.images.to(device) #[1 1 256 256 32]
+            x1 = series1.images.to(device) #[1 1 32 384 384]
             aff1 = series1.affine.to(device)
             assert x1.shape[0] == 1,f'x1.shape[0] must 1!'
 
-            x1_latent, x1_mu, x1_std = self.encoder(x1) #[1 4 32 96 96]维度可以多一些 
+            x1_latent = self.encoder.encode_3(x1) #[1 2 32 192 192]维度可以多一些 
+            x1_lat_new,_,_ = self.encoder.encode_2(x1_latent.repeat(1,2,1,1,1))
             m1_latent = torch.ones_like(x1_latent)  #因为全是1 所以可视化的时候会是黑的 这个时候只需要令某些值为0 即可显示出来
         
             # =======vae_w_register=======
             if register:
 
-                feat_regist = self.feat_regist
+                feat_regist = self.feat_regist[0]
 
                 x2 = series2.images.to(device)
                 aff2 = series2.affine.to(device)
 
 
-                x2_latent, x2_mu, x2_std = self.encoder(x2) #可以试试双向
+                x2_latent = self.encoder.encode_3(x2) #可以试试双向 downsample
+                x2_lat_new,_,_ = self.encoder.encode_2(x2_latent.repeat(1,2,1,1,1))
                 m2_latent = torch.ones_like(x2_latent)
 
-                # x1_latent = self.aspp(x1_latent)
-                x1tox2_latent,_,_,_ = feat_regist(x2_latent, aff2, x1_latent, aff1) # 1 --> 2 # x1tox2,_,_ = feat_regist(x2, aff2, x1, aff1)
-                _,m1tom2_latent,_,_ = feat_regist(m2_latent, aff2, m1_latent, aff1, aspp=False)
+                x1tox2_latent,_,_,_ = feat_regist(x2_latent, aff2, x1_latent, aff1) #[1 2 32 192 192] # 1 --> 2
+                _,m1tom2_latent,_,_ = feat_regist(m2_latent, aff2, m1_latent, aff1, aspp=False) #[1 1 32 192 192]
 
-                # x1_mu = self.aspp(x1_mu)
-                # x1_std = self.aspp(x1_std)
-                mu1tomu2,_,_,_ = feat_regist(x2_mu, aff2, x1_mu, aff1)
-                std1tostd2,_,_,_ = feat_regist(x2_std, aff2, x1_std, aff1)
+                x1tox2_latent = self.midblock(x1tox2_latent)#[1 2 32 192 192] midblock
+                x1tox2_latent,mu1tomu2,std1tostd2 = self.encoder.encode_2(x1tox2_latent) #[1 4 32 96 96] 重参数
 
-                #=======可视化========
-                # if save_resize_vis:
-                #     lat_size = x2_latent.shape[2:]
-                #     img_size = x1.shape[2:]
-                #     s1 = F.interpolate(x1, size=lat_size, mode='trilinear', align_corners=False) # x1 - resize
-                #     s2 = F.interpolate(x2, size=lat_size, mode='trilinear', align_corners=False)
-                #     s1tos2,_,_ = feat_regist(s2, aff2, s1, aff1)  #分成几步去插值
-                #     s1tos2tos1,_,_ = feat_regist(s1, aff1, s1tos2, aff2)
-                #     s1tos2tos1tox1 = F.interpolate(s1tos2tos1, size=img_size, mode='trilinear', align_corners=False)
-                #     #===========================
-                #     save_vis(x1,aff1,save_path,'s1.nii')
-                #     save_vis(s2,lat_aff2,save_path,'s2.nii')
-                #     save_vis(s1tos2,lat_aff2,save_path,'s1_to_s2.nii')
-                #     save_vis(s1tos2tos1,lat_aff1,save_path,'s1_to_s2_to_s1.nii')
-                #     save_vis(s1tos2tos1tox1,aff1,save_path,'s1_to_s2_to_s1_to_x1.nii')
-                #     #===========================
-                #     x1tox2,_,_ = feat_regist(x2, aff2, x1, aff1)
-                #     x1tox2tox1,_,_ = feat_regist(x1, aff1, x1tox2, aff2)
-                    #===========================
-                # save_vis(x1,aff1,save_path,'x1.nii')
-                    # save_vis(x2,aff2,save_path,'x2.nii')
-                    # save_vis(x1tox2,aff2,save_path,'x1_to_x2.nii')
-                    # save_vis(x1tox2tox1,aff1,save_path,'x1_to_x2_to_x1.nii')
-                #=====================
 
-                x1tox2_latent = self.midblock(x1tox2_latent) #[1 4 32 96 96]   #这个是最终想要得到的，希望视野内能包括更多信息
-
-                # x1tox2_latent = self.aspp(x1tox2_latent)
+                feat_regist = self.feat_regist[1]
+                x1_latent = F.interpolate(x1_latent.repeat(1, 2, 1, 1, 1), size=x1tox2_latent.shape[2:], mode='nearest') #[1 4 32 96 96] #feat1在配准过程中只起到形状的作用
                 x1_latent_new,_,_,_ = feat_regist(x1_latent, aff1, x1tox2_latent, aff2)
                 _,m1_latent_new,_,_ = feat_regist(m1_latent, aff1, m1tom2_latent, aff2, aspp=False) #因为feat_regist中有aspp所以 m1也不是全1了,但是m2没有经过aspp所以还全是1
                 m1_new = F.interpolate(m1_latent_new[0:1,0:1,...], size=x1.shape[2:], mode='nearest')
@@ -323,9 +308,15 @@ class Register_VAE(nn.Module):
                 x1_reconstruction = self.decoder(x1_latent_new)
                 x2_reconstruction = self.decoder(x1tox2_latent)
 
+                m1tom2_lat_new = F.interpolate(m1tom2_latent[0:1,0:1,...], size=x1tox2_latent.shape[2:], mode='nearest') #[1 1 32 96 96]
+                m1_lat_new = F.interpolate(m1_latent_new[0:1,0:1,...], size=x1_latent_new.shape[2:], mode='nearest') #[1 1 32 96 96]
+                lat_loss_1 = self.latloss(x1tox2_latent * m1tom2_lat_new, x2_lat_new * m1tom2_lat_new)
+                lat_loss_2 = self.latloss(x1_latent_new * m1_lat_new, x1_lat_new * m1_lat_new)
+
+
                 dic = { 
-                        'x1_mu':x1_mu,
-                        'x1_std':x1_std, 
+                        'x1_mu':None,
+                        'x1_std':None, 
                         'mu1tomu2':mu1tomu2,
                         'std1tostd2':std1tostd2, 
 
@@ -340,9 +331,12 @@ class Register_VAE(nn.Module):
                         'x2_input':x2 * m2_new,
                         'x2_input_ori':x2,
 
+                        'lat_loss_1':lat_loss_1,
+                        'lat_loss_2':lat_loss_2,
+
                         }
                 dic_list.append(dic)
-                del x1, x2, x1_latent, x2_latent, x1_mu, x1_std, x2_mu, x2_std, x1tox2_latent, x1_latent_new, m1_latent_new, m1tom2_latent
+                del x1, x2, x1_latent, x2_latent, x1tox2_latent, x1_latent_new, m1_latent_new, m1tom2_latent
                 del series1, series2, m1_new, m2_new, m2, feat_regist, x1_reconstruction, x2_reconstruction
                 # gc.collect()
                 
