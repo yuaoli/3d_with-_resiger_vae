@@ -297,10 +297,10 @@ class Register_VAE(nn.Module):
                 m1tom2_latent,_,_ = feat_regist(m2_latent, aff2, m1_latent, aff1, aspp=False) #[1 1 32 192 192]
 
                 x1tox2_latent = self.midblock(x1tox2_latent)#[1 4 32 192 192] midblock
-                x1tox2_latent,mu1tomu2,std1tostd2 = self.encoder.encode_2(x1tox2_latent) #[1 4 32 96 96] 重参数
+                x1tox2_latent,mu1tomu2,std1tostd2 = self.encoder.encode_2(x1tox2_latent) #[1 4 32 96 96] 重参数 这个是最终想要得到的
 
 
-                feat_regist = self.feat_regist[1]
+                feat_regist = self.feat_regist[0]
                 x1_latent_new,_,_ = feat_regist(x1_latent, aff1, x1tox2_latent, aff2)
                 m1_latent_new,_,_ = feat_regist(m1_latent, aff1, m1tom2_latent, aff2, aspp=False) #因为feat_regist中有aspp所以 m1也不是全1了,但是m2没有经过aspp所以还全是1
                 m1_new = F.interpolate(m1_latent_new[0:1,0:1,...], size=x1.shape[2:], mode='nearest')
@@ -311,7 +311,8 @@ class Register_VAE(nn.Module):
                 x2_reconstruction = self.decoder(x1tox2_latent)
 
 
-                lat_loss_x1 = self.latloss(x1_latent_new * m1_latent_new, x1_latent.detach() * m1_latent_new)
+                # lat_loss_x1 = self.latloss(x1_latent_new * m1_latent_new, x1_latent.detach() * m1_latent_new)
+                # lat_loss_x2 = self.latloss(x1tox2_latent * m1tom2_latent, x2_latent.detach() * m1tom2_latent)
 
 
                 dic = { 
@@ -331,9 +332,13 @@ class Register_VAE(nn.Module):
                         'x2_input':x2 * m2_new,
                         'x2_input_ori':x2,
 
-                        'lat_loss_x1':lat_loss_x1,
+                        # 'lat_loss_x1':lat_loss_x1,
                         'lat_x1':x1_latent.detach() * m1_latent_new,
-                        'lat_new_x1':x1_latent_new * m1_latent_new
+                        'lat_new_x1':x1_latent_new * m1_latent_new,
+
+                        # 'lat_loss_x2':lat_loss_x2,
+                        'lat_x2':x2_latent.detach() * m1tom2_latent,
+                        'lat_x1tox2':x1tox2_latent * m1tom2_latent
 
                         }
                 dic_list.append(dic)

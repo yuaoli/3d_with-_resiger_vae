@@ -337,15 +337,20 @@ def train(model, optimizer_vae,optimizer_disc, epoch, step, train_loader, Discri
             x2_kl_loss = KLLoss(x2_mu, x2_std)
 
             #lat_recloss
-            lat_rec_loss =  dic['lat_loss_x1']
+            
             lat_x1 = dic['lat_x1']
             lat_new_x1 = dic['lat_new_x1']
+            dic['lat_loss_x1'] = reconstruction_loss(lat_x1,lat_new_x1)
+            lat_x2 = dic['lat_x2']
+            lat_new_x2 = dic['lat_x1tox2']
+            dic['lat_loss_x2'] = reconstruction_loss(lat_x2,lat_new_x2)
+            lat_rec_loss =  0.5 * dic['lat_loss_x1']+ dic['lat_loss_x2']
 
             rec_loss = x1_rec_loss  + lat_rec_loss  #+ x2_rec_loss
             kl_loss = x1_kl_loss + x2_kl_loss
             vae_loss_3d = rec_loss * args.reconstruction_data_loss_weight + kl_loss * args.kl_latent_loss_weight
 
-            img_dis = False
+            img_dis = True
 
             #img_disloss
             if img_dis:
@@ -385,8 +390,8 @@ def train(model, optimizer_vae,optimizer_disc, epoch, step, train_loader, Discri
             else:
                 vae_losses_2d = []
                 disc_losses = []
-                B,C,D,H,W = lat_x1.shape
-                for input, reconstruction in [(lat_x1, lat_new_x1),]:  #两个重构回来的都计算gan_loss
+                B,C,D,H,W = lat_x2.shape
+                for input, reconstruction in [(lat_x2, lat_new_x2),]:  #两个重构回来的都计算gan_loss
                     input_2d_ = torch.mean(input.reshape(B*D,C,H,W),dim=1,keepdim=True)
                     reconstruction_2d_ = torch.mean(reconstruction.reshape(B*D,C,H,W),dim=1,keepdim=True)
                     gap = 8
@@ -418,7 +423,7 @@ def train(model, optimizer_vae,optimizer_disc, epoch, step, train_loader, Discri
 
 
 
-            train_vae_loss = torch.mean(torch.stack(vae_losses_2d))
+            train_vae_loss = torch.mean(torch.stack(vae_losses_2d)) #len = 16 = 2*(32/4)
             train_vae_loss += vae_loss_3d 
             train_disc_loss = torch.mean(torch.stack(disc_losses))
 
@@ -663,7 +668,7 @@ def main(rank, world_size, args):
                                             kl_weight = 1.0e-06,
                                             disc_in_channels=3,
                                             disc_weight = 0.5,
-                                            perceptual_weight=0.0)
+                                            )#perceptual_weight=1.0
 
     if args.distributed:
         Discriminator = Discriminator.to(rank)
@@ -841,8 +846,8 @@ if __name__ == "__main__":
     args.gpu_ids = [0,1,2,3,4,5]
     args.distributed = False
     args.resume_path = None
-    args.resume_path = '/mnt/users/3d_resiger_vae2/experiments/3d_vae_sag&cor_pdfs2024-12-15-16-23-16/gen/vol_256_lr_0.0001_kl_1e-05__bsize_1/checkpoints/model_00000500.pth.tar'
-    args.phase = 'test'
+    # args.resume_path = '/mnt/users/3d_resiger_vae2/experiments/3d_vae_sag&cor_pdfs2024-12-15-16-23-16/gen/vol_256_lr_0.0001_kl_1e-05__bsize_1/checkpoints/model_00000500.pth.tar'
+    args.phase = 'train'
     args.pretrain_path = None
     args.pretrain_path = '/mnt/users/3d_resiger_vae/experiments/3d_vae_sag_pd2024-11-29-16-00-33/gen/vol_256_lr_0.0001_kl_1e-05__bsize_1/checkpoints/model_00000060.pth.tar'
 
