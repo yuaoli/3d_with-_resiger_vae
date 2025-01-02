@@ -7,6 +7,7 @@ import numpy as np
 import os
 import time
 import SimpleITK as sitk
+import torchvision
 # from .DenseASPP import DenseASPP
 # from .DenseASPP121 import Model_CFG
 import gc
@@ -88,12 +89,12 @@ class ResBlockMid(nn.Module):
         super(ResBlockMid, self).__init__()
         self.act = act
         self.conv1_block = nn.Sequential(
-            nn.Conv3d(filters_in, filters_in, 3, stride=1, padding=1),
-            nn.BatchNorm3d(filters_in),
+            nn.Conv3d(filters_in, filters_out, 3, stride=1, padding=1),
+            nn.BatchNorm3d(filters_out),
             nn.LeakyReLU(0.2, inplace=False))
         self.conv2_block = nn.Sequential(
-            nn.Conv3d(filters_in, filters_in, 3, stride=1, padding=1),
-            nn.BatchNorm3d(filters_in),
+            nn.Conv3d(filters_out, filters_out, 3, stride=1, padding=1),
+            nn.BatchNorm3d(filters_out),
             nn.LeakyReLU(0.2, inplace=False))
         self.lrelu = nn.LeakyReLU(0.2, inplace=False)
         
@@ -149,31 +150,20 @@ class Encoder(nn.Module):
             nn.LeakyReLU(0.2, inplace=False))
 
         self.res1 = ResBlockDown(gf_dim * 1, gf_dim * 1) #2 2
+        self.res2 = ResBlockDown(gf_dim * 1, gf_dim * 2) #1 4
 
         self.res2_mu = ResBlockDown(gf_dim * 2, gf_dim * 2) #2 4
         self.res2_stdev = ResBlockDown(gf_dim * 2, gf_dim * 2, act=False)  
 
-        self.res3_mu = ResBlockDown(gf_dim * 1, gf_dim * 2) #4 8 
-        self.res3_stdev = ResBlockDown(gf_dim * 1, gf_dim * 2, act=False)
 
-    def encode_1(self, x):#[1 1 32 384 384]
+    def encode(self, x):#[1 1 32 384 384]
+
         conv1 = self.conv1_block(x) #[1 2 32 384 384]
         z = self.res1(conv1)        #[1 2 32 192 192]        
         z_mean = self.res2(z)       #[1, 4, 32, 96, 96]
         z_std = self.res2_stdev(z)  #[1, 4, 32, 96, 96]
-        return z_mean, z_std
-    
-    def encode_2(self, z):#[1 1 32 384 384]
-        z_mean = self.res2_mu(z)       #[1, 4, 32, 96, 96]
-        z_std = self.res2_stdev(z)  #[1, 4, 32, 96, 96]
-        z =  self.reparameterize(z_mean, z_std)
-        return z,z_mean,z_std
 
-    def encode_3(self, x):#[1 1 32 384 384]
-        conv1 = self.conv1_block(x) #[1 2 32 384 384]
-        z = self.res1(conv1)        #[1 2 32 192 192]        
-        return z
-    
+        return z_mean, z_std
 
     def reparameterize(self, mu, std):
         std = torch.exp(std)
@@ -181,9 +171,21 @@ class Encoder(nn.Module):
         return mu + eps*std
 
     def forward(self, x):
-        mu, std = self.encode_1(x)
+        mu, std = self.encode(x)
         z = self.reparameterize(mu, std)
         return z, mu, std
+    
+    def encode_1(self, x):#[1 1 32 384 384]
+        conv1 = self.conv1_block(x) #[1 2 32 384 384]
+        z = self.res1(conv1)        #[1 2 32 192 192]
+        z = self.res2(z)        
+        return z
+
+    def encode_2(self, z):#[1 1 32 384 384]
+        z_mean = self.res2_mu(z)       #[1, 4, 32, 96, 96]
+        z_std = self.res2_stdev(z)  #[1, 4, 32, 96, 96]
+        z =  self.reparameterize(z_mean, z_std)
+        return z,z_mean,z_std
 
 
 class Decoder(nn.Module):
@@ -229,22 +231,23 @@ class Midblock(nn.Module):
         super(Midblock, self).__init__()
 
         # gf_dim = int(gf_dim/2)
-        self.res0 = ResBlockMid(gf_dim*2, gf_dim * 1)
+        self.res0 = ResBlockMid(gf_dim*2, gf_dim * 2)
         self.res1 = ResBlockMid(gf_dim*2, gf_dim * 2)
         self.conv_1_block = nn.Sequential(
             nn.Conv3d(gf_dim*2, gf_dim*2, 3, stride=1, padding=1),
+            nn.Upsample(scale_factor=(1,2,2), mode='nearest'),
             nn.BatchNorm3d(gf_dim*2),
             nn.LeakyReLU(0.2, inplace=False))
 
     def forward(self, z): #[1, 4, 32, 96, 96]
-        x = self.res0(z) #[1, 2, 32, 192, 192]
-        x = self.res1(x)#[1, 2, 32, 384, 384]
+        x = self.res0(z) #[1, 4, 32, 96, 96]
+        x = self.res1(x)#[1, 4, 32, 96, 96]
         x = self.conv_1_block(x)
-        return x
+        return x #[1, 4, 32, 192, 192]
 
     
 class Register_VAE(nn.Module):
-    def __init__(self, n_channels, gf_dim=16, depth=2,feat_regist=None,lightingdecoder=False, encoder_pre=False, decoder_pre=False):
+    def __init__(self, n_channels, gf_dim=16, depth=2,feat_regist=None,mask_regist=None,lightingdecoder=False, encoder_pre=False, decoder_pre=False):
         super(Register_VAE, self).__init__()
         self.encoder = Encoder(n_channels, gf_dim)
         if not lightingdecoder:
@@ -253,14 +256,16 @@ class Register_VAE(nn.Module):
             self.decoder = LightingDecoder(n_channels, gf_dim)
         if encoder_pre:
             print(f"Loaded pretrained encoder weights ...")
-            # self.encoder.eval()
+            self.encoder.eval()
         if decoder_pre:
             print(f"Loaded pretrained decoder weights ...")
-            # self.decoder.eval()
+            self.decoder.eval()
 
         self.midblock = Midblock(n_channels, gf_dim)
         self.feat_regist = feat_regist
-        self.latloss = nn.MSELoss()
+        self.mask_regist = mask_regist
+        self.latloss = nn.MSELoss(reduction='mean')
+
 
     # @profile
     def forward(self,series1_, series2_, device=None ,save_resize_vis=False,save_path=None ):#(x1--原仿射矩阵,x2--目标仿射矩阵) #im1, aff1, im2, aff2
@@ -273,8 +278,7 @@ class Register_VAE(nn.Module):
             aff1 = series1.affine.to(device)
             assert x1.shape[0] == 1,f'x1.shape[0] must 1!'
 
-            x1_latent = self.encoder.encode_3(x1) #[1 2 32 192 192]维度可以多一些 
-            x1_lat_new,_,_ = self.encoder.encode_2(x1_latent.repeat(1,2,1,1,1))
+            x1_latent = self.encoder.encode_1(x1) #[1 4 32 96 96] downsample
             m1_latent = torch.ones_like(x1_latent)  #因为全是1 所以可视化的时候会是黑的 这个时候只需要令某些值为0 即可显示出来
         
             # =======vae_w_register=======
@@ -286,21 +290,19 @@ class Register_VAE(nn.Module):
                 aff2 = series2.affine.to(device)
 
 
-                x2_latent = self.encoder.encode_3(x2) #可以试试双向 downsample
-                x2_lat_new,_,_ = self.encoder.encode_2(x2_latent.repeat(1,2,1,1,1))
+                x2_latent = self.encoder.encode_1(x2) # downsample
                 m2_latent = torch.ones_like(x2_latent)
 
-                x1tox2_latent,_,_,_ = feat_regist(x2_latent, aff2, x1_latent, aff1) #[1 2 32 192 192] # 1 --> 2
-                _,m1tom2_latent,_,_ = feat_regist(m2_latent, aff2, m1_latent, aff1, aspp=False) #[1 1 32 192 192]
+                x1tox2_latent,_,_ = feat_regist(x2_latent, aff2, x1_latent, aff1) #[1 4 32 96 96] # 1 --> 2  #糊的原因就是在r的地方丢失了太多东西
+                m1tom2_latent,_,_ = feat_regist(m2_latent, aff2, m1_latent, aff1, aspp=False) #[1 1 32 192 192]
 
-                x1tox2_latent = self.midblock(x1tox2_latent)#[1 2 32 192 192] midblock
+                x1tox2_latent = self.midblock(x1tox2_latent)#[1 4 32 192 192] midblock
                 x1tox2_latent,mu1tomu2,std1tostd2 = self.encoder.encode_2(x1tox2_latent) #[1 4 32 96 96] 重参数
 
 
                 feat_regist = self.feat_regist[1]
-                x1_latent = F.interpolate(x1_latent.repeat(1, 2, 1, 1, 1), size=x1tox2_latent.shape[2:], mode='nearest') #[1 4 32 96 96] #feat1在配准过程中只起到形状的作用
-                x1_latent_new,_,_,_ = feat_regist(x1_latent, aff1, x1tox2_latent, aff2)
-                _,m1_latent_new,_,_ = feat_regist(m1_latent, aff1, m1tom2_latent, aff2, aspp=False) #因为feat_regist中有aspp所以 m1也不是全1了,但是m2没有经过aspp所以还全是1
+                x1_latent_new,_,_ = feat_regist(x1_latent, aff1, x1tox2_latent, aff2)
+                m1_latent_new,_,_ = feat_regist(m1_latent, aff1, m1tom2_latent, aff2, aspp=False) #因为feat_regist中有aspp所以 m1也不是全1了,但是m2没有经过aspp所以还全是1
                 m1_new = F.interpolate(m1_latent_new[0:1,0:1,...], size=x1.shape[2:], mode='nearest')
                 m2_new = F.interpolate(m1tom2_latent[0:1,0:1,...], size=x2.shape[2:], mode='nearest')
                 m2 = F.interpolate(m2_latent[0:1,0:1,...], size=x2.shape[2:], mode='nearest')
@@ -308,10 +310,8 @@ class Register_VAE(nn.Module):
                 x1_reconstruction = self.decoder(x1_latent_new)
                 x2_reconstruction = self.decoder(x1tox2_latent)
 
-                m1tom2_lat_new = F.interpolate(m1tom2_latent[0:1,0:1,...], size=x1tox2_latent.shape[2:], mode='nearest') #[1 1 32 96 96]
-                m1_lat_new = F.interpolate(m1_latent_new[0:1,0:1,...], size=x1_latent_new.shape[2:], mode='nearest') #[1 1 32 96 96]
-                lat_loss_1 = self.latloss(x1tox2_latent * m1tom2_lat_new, x2_lat_new * m1tom2_lat_new)
-                lat_loss_2 = self.latloss(x1_latent_new * m1_lat_new, x1_lat_new * m1_lat_new)
+
+                lat_loss_x1 = self.latloss(x1_latent_new * m1_latent_new, x1_latent.detach() * m1_latent_new)
 
 
                 dic = { 
@@ -331,8 +331,9 @@ class Register_VAE(nn.Module):
                         'x2_input':x2 * m2_new,
                         'x2_input_ori':x2,
 
-                        'lat_loss_1':lat_loss_1,
-                        'lat_loss_2':lat_loss_2,
+                        'lat_loss_x1':lat_loss_x1,
+                        'lat_x1':x1_latent.detach() * m1_latent_new,
+                        'lat_new_x1':x1_latent_new * m1_latent_new
 
                         }
                 dic_list.append(dic)

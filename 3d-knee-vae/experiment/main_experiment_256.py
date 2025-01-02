@@ -290,15 +290,15 @@ def train(model, optimizer_vae,optimizer_disc, epoch, step, train_loader, Discri
 
     model.train()
     Discriminator.train()
-    train_vae_loss_sum = 0
-    train_disc_loss_sum = 0 
 
     def get_last_layer():
         if ddp:
             return model.module.net.decoder.out.weight
         else:
             return model.net.decoder.out.weight
-
+        
+    train_vae_loss_sum = 0  #对走过的所有步数计算平均值
+    train_disc_loss_sum = 0 
     for i, batch in enumerate(tqdm(train_loader, desc="Training", unit="batch")):
 
         # if i == 19:
@@ -313,9 +313,7 @@ def train(model, optimizer_vae,optimizer_disc, epoch, step, train_loader, Discri
             optimizer_vae.zero_grad()
             optimizer_disc.zero_grad()
 
-            vae_loss_3d = 0
-            vae_losses_2d = []
-            disc_losses = []
+            vae_loss_3d = 0 #每对数据算一下 一组数据算两次
 
             #x1
             x1_rec_loss = 0
@@ -324,7 +322,7 @@ def train(model, optimizer_vae,optimizer_disc, epoch, step, train_loader, Discri
             x1_input = dic['x1_input']
             # x1_mu = dic['x1_mu']
             # x1_std = dic['x1_std']
-            x1_rec_loss += reconstruction_loss(x1_reconstruction,x1_input)
+            x1_rec_loss = reconstruction_loss(x1_reconstruction,x1_input)
             # x1_kl_loss += KLLoss(x1_mu, x1_std) * 0.5     #这个是不是也可以设置一下开始步长，最初让先稳定一下encode
             x1_kl_loss = 0.
 
@@ -335,47 +333,90 @@ def train(model, optimizer_vae,optimizer_disc, epoch, step, train_loader, Discri
             x2_input = dic['x2_input']
             x2_mu = dic['mu1tomu2']
             x2_std = dic['std1tostd2']
-            x2_rec_loss += reconstruction_loss(x2_reconstruction,x2_input)
-            x2_kl_loss += KLLoss(x2_mu, x2_std)
+            x2_rec_loss = reconstruction_loss(x2_reconstruction,x2_input)
+            x2_kl_loss = KLLoss(x2_mu, x2_std)
 
             #lat_recloss
-            lat_rec_loss = dic['lat_loss_1'] + dic['lat_loss_2']
+            lat_rec_loss =  dic['lat_loss_x1']
+            lat_x1 = dic['lat_x1']
+            lat_new_x1 = dic['lat_new_x1']
 
-            rec_loss = x1_rec_loss + x2_rec_loss + lat_rec_loss
+            rec_loss = x1_rec_loss  + lat_rec_loss  #+ x2_rec_loss
             kl_loss = x1_kl_loss + x2_kl_loss
-            vae_loss_3d += rec_loss * args.reconstruction_data_loss_weight + kl_loss * args.kl_latent_loss_weight
+            vae_loss_3d = rec_loss * args.reconstruction_data_loss_weight + kl_loss * args.kl_latent_loss_weight
+
+            img_dis = False
+
+            #img_disloss
+            if img_dis:
+                vae_losses_2d = []
+                disc_losses = []
+                B,C,D,H,W = x1_input.shape
+                for input, reconstruction in (x1_input, x1_reconstruction),(x2_input, x2_reconstruction):  #两个重构回来的都计算gan_loss
+                    input_2d_ = input.reshape(B*D,C,H,W)
+                    reconstruction_2d_ = reconstruction.reshape(B*D,C,H,W)
+                    gap = 4
+                    for b in range(0,B*D,gap):
+                        input_2d = input_2d_[b:b+1,:,:,:]
+                        reconstruction_2d = reconstruction_2d_[b:b+1,:,:,:] #[:,:,s,:,:]
+
+                        try:
+                            loss_vae_2d, log_vae_2d = Discriminator(input_2d,
+                                                                reconstruction_2d,
+                                                                posteriors = DiagonalGaussianDistribution(x2_mu, x2_std), 
+                                                                optimizer_idx=0, 
+                                                                global_step = step,
+                                                                last_layer=get_last_layer(),
+                                                                )
+                            loss_disc, log_disc = Discriminator(input_2d.detach(),
+                                                                reconstruction_2d.detach(),
+                                                                posteriors = DiagonalGaussianDistribution(x2_mu, x2_std),
+                                                                optimizer_idx=1,
+                                                                global_step = step,
+                                                                last_layer=get_last_layer(),)
+                        
+                            vae_losses_2d.append(loss_vae_2d)
+                            disc_losses.append(loss_disc)
+
+                        except RuntimeError as e:
+                            print(f"Error in batch {i}, sub-batch {b}: {e}")
+                            continue
+            #lat_disloss
+            else:
+                vae_losses_2d = []
+                disc_losses = []
+                B,C,D,H,W = lat_x1.shape
+                for input, reconstruction in [(lat_x1, lat_new_x1),]:  #两个重构回来的都计算gan_loss
+                    input_2d_ = torch.mean(input.reshape(B*D,C,H,W),dim=1,keepdim=True)
+                    reconstruction_2d_ = torch.mean(reconstruction.reshape(B*D,C,H,W),dim=1,keepdim=True)
+                    gap = 8
+                    for b in range(0,B*D,gap):
+                        input_2d = input_2d_[b:b+1,:,:,:]
+                        reconstruction_2d = reconstruction_2d_[b:b+1,:,:,:] #[:,:,s,:,:]
+
+                        try:
+                            loss_vae_2d, log_vae_2d = Discriminator(input_2d,
+                                                                reconstruction_2d,
+                                                                posteriors = DiagonalGaussianDistribution(x2_mu, x2_std), 
+                                                                optimizer_idx=0, 
+                                                                global_step = step,
+                                                                last_layer=get_last_layer(),
+                                                                )
+                            loss_disc, log_disc = Discriminator(input_2d.detach(),
+                                                                reconstruction_2d.detach(),
+                                                                posteriors = DiagonalGaussianDistribution(x2_mu, x2_std),
+                                                                optimizer_idx=1,
+                                                                global_step = step,
+                                                                last_layer=get_last_layer(),)
+                        
+                            vae_losses_2d.append(loss_vae_2d)
+                            disc_losses.append(loss_disc)
+
+                        except RuntimeError as e:
+                            print(f"Error in batch {i}, sub-batch {b}: {e}")
+                            continue
 
 
-            B,C,D,H,W = x1_input.shape
-            for input, reconstruction in (x1_input, x1_reconstruction),(x2_input, x2_reconstruction):  #两个重构回来的都计算gan_loss
-                input_2d_ = input.reshape(B*D,C,H,W)
-                reconstruction_2d_ = reconstruction.reshape(B*D,C,H,W)
-                gap = 4
-                for b in range(0,B*D,gap):
-                    input_2d = input_2d_[b:b+1,:,:,:]
-                    reconstruction_2d = reconstruction_2d_[b:b+1,:,:,:] #[:,:,s,:,:]
-
-                    try:
-                        loss_vae_2d, log_vae_2d = Discriminator(input_2d,
-                                                            reconstruction_2d,
-                                                            posteriors = DiagonalGaussianDistribution(x2_mu, x2_std), 
-                                                            optimizer_idx=0, 
-                                                            global_step = step,
-                                                            last_layer=get_last_layer(),
-                                                            )
-                        loss_disc, log_disc = Discriminator(input_2d.detach(),
-                                                            reconstruction_2d.detach(),
-                                                            posteriors = DiagonalGaussianDistribution(x2_mu, x2_std),
-                                                            optimizer_idx=1,
-                                                            global_step = step,
-                                                            last_layer=get_last_layer(),)
-                    
-                        vae_losses_2d.append(loss_vae_2d)
-                        disc_losses.append(loss_disc)
-
-                    except RuntimeError as e:
-                        print(f"Error in batch {i}, sub-batch {b}: {e}")
-                        continue
 
             train_vae_loss = torch.mean(torch.stack(vae_losses_2d))
             train_vae_loss += vae_loss_3d 
@@ -394,34 +435,36 @@ def train(model, optimizer_vae,optimizer_disc, epoch, step, train_loader, Discri
             del input_2d_, reconstruction_2d_, loss_vae_2d, loss_disc, input_2d, reconstruction_2d
 
 
-        step += 1
+            step += 1
 
-        writer.add_scalar('Loss/train_vae_sum', train_vae_loss.item(), step)
+            writer.add_scalar('Loss/train_vae_sum', train_vae_loss.item(), step)
 
-        writer.add_scalar('Loss/train_3d_vae', vae_loss_3d.item(), step)
-        writer.add_scalar('Loss/train_3d_reconstruction_data_loss', rec_loss.item(), step)
-        writer.add_scalar('Loss/train_3d_kl_latent_loss', kl_loss.item(), step)
+            writer.add_scalar('Loss/train_3d_vae', vae_loss_3d.item(), step)
+            writer.add_scalar('Loss/train_3d_reconstruction_data_loss', x1_rec_loss.item(), step)
+            writer.add_scalar('Loss/train_3d_kl_latent_loss', kl_loss.item(), step)
+            writer.add_scalar('Loss/train_3d_latent_loss', lat_rec_loss.item(), step)
 
-        writer.add_scalar('Loss/train_2d_reconstruction_data_loss', log_vae_2d['train/rec_loss'].item(), step)
-        writer.add_scalar('Loss/train_nll_loss', log_vae_2d['train/nll_loss'].item(), step)
-        writer.add_scalar('Loss/train_g_loss', log_vae_2d['train/g_loss'].item(), step)
+            writer.add_scalar('Loss/train_2d_reconstruction_data_loss', log_vae_2d['train/rec_loss'].item(), step)
+            writer.add_scalar('Loss/train_nll_loss', log_vae_2d['train/nll_loss'].item(), step)
+            writer.add_scalar('Loss/train_g_loss', log_vae_2d['train/g_loss'].item(), step)
 
-        writer.add_scalar('Loss/train_disc_sum', train_disc_loss.item(), step)
-        writer.add_scalar('Loss/train_real', log_disc['train/logits_real'].item(), step)
-        writer.add_scalar('Loss/train_fake', log_disc['train/logits_fake'].item(), step)
+            writer.add_scalar('Loss/train_disc_sum', train_disc_loss.item(), step)
+            writer.add_scalar('Loss/train_real', log_disc['train/logits_real'].item(), step)
+            writer.add_scalar('Loss/train_fake', log_disc['train/logits_fake'].item(), step)
 
-        if i % log_interval == 0: #因为数据太少 所以这个每个只在每个epoch开始的时候保存一次
-            print('Train Vae Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
-                epoch, i * len(batch['sag_dirs']['images']), len(train_loader.dataset),
-                    100. * i / len(train_loader) * 2,
-                    train_vae_loss.item() / len(batch['sag_dirs']['images'])))
-            print('Train Disc Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
-                epoch, i * len(batch['sag_dirs']['images']), len(train_loader.dataset),
-                    100. * i / len(train_loader),
-                    train_disc_loss.item() / len(batch['sag_dirs']['images'])))
+        if step % log_interval == 0: #因为数据太少 所以这个每个只在每个epoch开始的时候保存一次
+            # print('Train Vae Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+            #     epoch, i * len(batch['sag_dirs']['images']), len(train_loader.dataset),
+            #         100. * i / len(train_loader) * 2,
+            #         train_vae_loss_sum.item() / len(batch['sag_dirs']['images'])))
+            # print('Train Disc Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+            #     epoch, i * len(batch['sag_dirs']['images']), len(train_loader.dataset),
+            #         100. * i / len(train_loader),
+            #         train_disc_loss_sum.item() / len(batch['sag_dirs']['images'])))
             
             save_path = os.path.join(results_dir,'train',str(epoch)+'_epoch',str(i)+'_step')
             os.makedirs(save_path,exist_ok=True)
+
 
             #暂时先只可视化sag to cor 单向的结果 但是训练的是双向的
             sag_img, cor_img,sag_ori_img,cor_ori_img = sagtocor_dict['x1_input'],sagtocor_dict['x2_input'],sagtocor_dict['x1_input_ori'],sagtocor_dict['x2_input_ori']
@@ -504,9 +547,9 @@ def test(model, epoch, step, test_loader, Discriminator, writer,
                 x2_kl_loss += KLLoss(x2_mu, x2_std)
 
                 #lat_recloss
-                lat_rec_loss = dic['lat_loss_1'] + dic['lat_loss_2']
+                lat_rec_loss = dic['lat_loss_x1'] #dic['lat_loss_1'] + dic['lat_loss_2']
 
-                rec_loss = x1_rec_loss + x2_rec_loss + lat_rec_loss
+                rec_loss = x1_rec_loss  + lat_rec_loss  #+ x2_rec_loss
                 kl_loss = x1_kl_loss + x2_kl_loss
                 vae_loss_3d += rec_loss * args.reconstruction_data_loss_weight + kl_loss * args.kl_latent_loss_weight
 
@@ -583,16 +626,17 @@ def test(model, epoch, step, test_loader, Discriminator, writer,
             save_path = os.path.join(results_dir,'test','epoch_' + str(epoch),'img_'+str(i))
             os.makedirs(save_path,exist_ok=True)
 
-            #暂时先只可视化sag to cor 单向的结果 但是训练的是双向的
-            sag_img, cor_img,sag_ori_img,cor_ori_img = sagtocor_dict['x1_input'],sagtocor_dict['x2_input'],sagtocor_dict['x1_input_ori'],sagtocor_dict['x2_input_ori']
-            sag_reconstruction,cor_reconstruction = sagtocor_dict['x1_reconstruction'],sagtocor_dict['x2_reconstruction']
-            save_vis(sag_reconstruction , path = os.path.join(save_path,'sag_reconstruction_sitk'+'.nii.gz'))
-            save_vis(sag_img,  path = os.path.join(save_path,'sag_input_sitk'+'.nii.gz'))
-            save_vis(cor_reconstruction , path = os.path.join(save_path,'cor_reconstruction_sitk'+'.nii.gz'))
-            save_vis(cor_img,  path = os.path.join(save_path,'cor_input_sitk'+'.nii.gz'))
-            save_vis(sag_ori_img,  path = os.path.join(save_path,'sag_input_ori'+'.nii.gz'))
-            save_vis(cor_ori_img,  path = os.path.join(save_path,'cor_input_ori'+'.nii.gz'))            
-            del sag_img, sag_reconstruction, cor_img, cor_reconstruction 
+            # if epoch % (args.val_epoch_interval*2) == 0:
+            #     #暂时先只可视化sag to cor 单向的结果 但是训练的是双向的
+            #     sag_img, cor_img,sag_ori_img,cor_ori_img = sagtocor_dict['x1_input'],sagtocor_dict['x2_input'],sagtocor_dict['x1_input_ori'],sagtocor_dict['x2_input_ori']
+            #     sag_reconstruction,cor_reconstruction = sagtocor_dict['x1_reconstruction'],sagtocor_dict['x2_reconstruction']
+            #     save_vis(sag_reconstruction , path = os.path.join(save_path,'sag_reconstruction_sitk'+'.nii.gz'))
+            #     save_vis(sag_img,  path = os.path.join(save_path,'sag_input_sitk'+'.nii.gz'))
+            #     save_vis(cor_reconstruction , path = os.path.join(save_path,'cor_reconstruction_sitk'+'.nii.gz'))
+            #     save_vis(cor_img,  path = os.path.join(save_path,'cor_input_sitk'+'.nii.gz'))
+            #     save_vis(sag_ori_img,  path = os.path.join(save_path,'sag_input_ori'+'.nii.gz'))
+            #     save_vis(cor_ori_img,  path = os.path.join(save_path,'cor_input_ori'+'.nii.gz'))            
+            #     del sag_img, sag_reconstruction, cor_img, cor_reconstruction 
 
     writer.flush()
     print('====> Test vae set loss: {:.4f}'.format(test_vae_loss_sum / n_test))
@@ -614,12 +658,12 @@ def main(rank, world_size, args):
 
     torch.manual_seed(args.seed)
 
-    model = DualViewSegNet(args.n_channels, gf_dim=2, lat_ch1=2, lat_ch2 = 4, ld=False)
+    model = DualViewSegNet(args.n_channels, gf_dim=2, lat_ch1=4, lat_ch2 = 4, ld=False, encoder_pre=True, decoder_pre=True)
     Discriminator = LPIPSWithDiscriminator(disc_start = 8001,
                                             kl_weight = 1.0e-06,
                                             disc_in_channels=3,
                                             disc_weight = 0.5,
-                                            perceptual_weight=1.0)
+                                            perceptual_weight=0.0)
 
     if args.distributed:
         Discriminator = Discriminator.to(rank)
@@ -703,12 +747,12 @@ def main(rank, world_size, args):
         try:
             model.net.encoder.load_state_dict(remove_module_prefix(pre_model['model'],strict=False))
             model.net.decoder.load_state_dict(remove_module_prefix(pre_model['model'],strict=False))
-            model = DualViewSegNet(args.n_channels, gf_dim=2, lat_ch1 = 4,lat_ch2 = 4, ld=False, encoder_pre=True, decoder_pre=True)
+            # model = DualViewSegNet(args.n_channels, gf_dim=2, lat_ch1 = 4,lat_ch2 = 4, ld=False, encoder_pre=True, decoder_pre=True)
             model = model.to(rank)
         except:
             model.net.encoder.load_state_dict(pre_model['model'],strict=False) 
             model.net.decoder.load_state_dict(pre_model['model'],strict=False)
-            model = DualViewSegNet(args.n_channels, gf_dim=2, lat_ch1 = 4,lat_ch2 = 4, ld=False, encoder_pre=True, decoder_pre=True)        
+            # model = DualViewSegNet(args.n_channels, gf_dim=2, lat_ch1 = 4,lat_ch2 = 4, ld=False, encoder_pre=True, decoder_pre=True)        
             model = model.to(rank)
 
     writer = tensorboard.SummaryWriter(log_dir=tb_dir)
@@ -797,10 +841,10 @@ if __name__ == "__main__":
     args.gpu_ids = [0,1,2,3,4,5]
     args.distributed = False
     args.resume_path = None
-    # args.resume_path = '/mnt/users/3d_resiger_vae2/experiments/3d_vae_sag&cor_pdfs2024-11-21-15-26-20/gen/vol_256_lr_0.0001_kl_1e-05__bsize_1/checkpoints/model_00000001.pth.tar'
-    args.phase = 'train'
+    args.resume_path = '/mnt/users/3d_resiger_vae2/experiments/3d_vae_sag&cor_pdfs2024-12-15-16-23-16/gen/vol_256_lr_0.0001_kl_1e-05__bsize_1/checkpoints/model_00000500.pth.tar'
+    args.phase = 'test'
     args.pretrain_path = None
-    # args.pretrain_path = '/mnt/users/3d_resiger_vae/experiments/3d_vae_sag_pd2024-11-19-17-13-31/gen/vol_256_lr_0.0001_kl_1e-05__bsize_1/checkpoints/model_00000059.pth.tar'
+    args.pretrain_path = '/mnt/users/3d_resiger_vae/experiments/3d_vae_sag_pd2024-11-29-16-00-33/gen/vol_256_lr_0.0001_kl_1e-05__bsize_1/checkpoints/model_00000060.pth.tar'
 
     ''' cuda devices '''
     gpu_str = ','.join(str(x) for x in args.gpu_ids)

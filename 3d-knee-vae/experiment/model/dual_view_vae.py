@@ -50,7 +50,7 @@ class FeatureRegistration(nn.Module):
         if use_out_embedding:
             self.out_fov_embedding = nn.Embedding(1, feat_dim)
 
-        self.aspp_1 = SimpleASPP(3,in_channels=2,conv_out_channels=1)#,kernel_sizes=[1,3],dilations=[1,2]
+        self.aspp_1 = SimpleASPP(3,in_channels=2,conv_out_channels=1,kernel_sizes=[1,3],dilations=[1,2])#,kernel_sizes=[1,3],dilations=[1,2]
         self.aspp_2 = SimpleASPP(3,in_channels=4,conv_out_channels=1)
 
         self.conv_1 = nn.Conv3d(in_channels=2, out_channels=2, kernel_size=3, stride=2, padding=1)
@@ -134,23 +134,23 @@ class FeatureRegistration(nn.Module):
             in_fov = F.grid_sample(torch.ones_like(feats2[:, :1]), grid, mode="bilinear", align_corners=align_corners)
             # in_fov 的值在视野内的区域接近 1，在视野外的区域接近 0
             # print((in_fov == 1).float().mean(dim=(4, 3))[:, 0])
-            if not aspp: #mask
-                binary_mask = (in_fov > 0.5).float()
-                feats = None
-            else:
-                binary_mask = None
-                feats = self.out_fov_embedding.weight[:, :, None, None, None].to(feats1.device) * (1 - in_fov) + in_fov * feats  # todo: use expand dims
-
+            # if not aspp: #mask
+            #     binary_mask = (in_fov > 0.5).float()
+            #     feats = None
+            # else:
+            #     binary_mask = None
+            #     feats = self.out_fov_embedding.weight[:, :, None, None, None].to(feats1.device) * (1 - in_fov) + in_fov * feats  # todo: use expand dims
+            feats = self.out_fov_embedding.weight[:, :, None, None, None].to(feats1.device) * (1 - in_fov) + in_fov * feats
         del inv_affine2, theta, grid
-        return feats,binary_mask
+        return feats #,binary_mask
     
     # @profile
     def forward(self, feats1, affine1, feats2, affine2,aspp=True):
         affine1 = self._transform_affine_to_feature(feats1, affine1, (self.T1,) + self.spatial_dim1)
         affine2 = self._transform_affine_to_feature(feats2, affine2, (self.T2,) + self.spatial_dim2)
-        feats2_to_1,mask= self._regist_feats2_to_feats1(feats1, affine1, feats2, affine2, True, aspp=aspp)  # seems to align better
+        feats2_to_1= self._regist_feats2_to_feats1(feats1, affine1, feats2, affine2, True, aspp=aspp)  # seems to align better
 
-        return feats2_to_1,mask,affine1,affine2
+        return feats2_to_1,affine1,affine2
 
 
 
@@ -164,11 +164,14 @@ class DualViewSegNet(nn.Module):
 
         self.filters = [lat_ch1,lat_ch2]
         self.feat_regist = []
-        self.feat_regist.append(FeatureRegistration((384, 384), (384, 384), 32, 32, self.filters[0]*2, use_out_embedding=True).to('cuda'))  #[（ori_w,ori_h）,（ori_w,ori_h）,ori_d,ori_d]
+        self.feat_regist.append(FeatureRegistration((384, 384), (384, 384), 32, 32, self.filters[0], use_out_embedding=True).to('cuda'))  #[（ori_w,ori_h）,（ori_w,ori_h）,ori_d,ori_d]
         self.feat_regist.append(FeatureRegistration((384, 384), (384, 384), 32, 32, self.filters[1], use_out_embedding=True).to('cuda'))
         
+        self.mask_regist = FeatureRegistration((384, 384), (384, 384), 32, 32, self.filters[1], use_out_embedding=False).to('cuda')
+
         self.net_depth = 2 #384-->96 步长为2
-        self.net = Register_VAE(n_channels, gf_dim,self.net_depth, self.feat_regist, lightingdecoder=self.ld, encoder_pre= encoder_pre, decoder_pre=decoder_pre)
+        self.net = Register_VAE(n_channels, gf_dim,self.net_depth, self.feat_regist, self.mask_regist, lightingdecoder=self.ld, encoder_pre= encoder_pre, decoder_pre=decoder_pre)
+
 
 
     # @profile
